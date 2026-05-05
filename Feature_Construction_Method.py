@@ -19,8 +19,6 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
@@ -33,6 +31,7 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.base import clone
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
+from scipy.stats import spearmanr
 
 # Configure warnings and logging
 warnings.filterwarnings('ignore')
@@ -70,6 +69,137 @@ try:
     _ef_mod.consistency_check = lambda learner: None
 except (ImportError, AttributeError) as e:
     logger.warning(f"Evolutionary Forest compatibility patch failed: {e}")
+
+def extract_symbolic_transformer_formulas(stgp_model, selected_indices: list = None) -> dict:
+    """
+    Extract and display formulas from Symbolic Transformer (STGP).
+    
+    Parameters:
+    -----------
+    stgp_model : SymbolicTransformer
+        Fitted SymbolicTransformer model
+    selected_indices : list
+        Indices of selected features (optional - if None, shows all)
+    
+    Returns:
+    --------
+    dict : Dictionary mapping feature index to formula
+    """
+    formulas = {}
+    try:
+        if hasattr(stgp_model, '_programs'):
+            programs = stgp_model._programs
+            indices_to_show = selected_indices if selected_indices is not None else range(len(programs))
+            
+            for idx in indices_to_show:
+                if idx < len(programs):
+                    formula = str(programs[idx])
+                    formulas[f'STGP_{idx}'] = formula
+                    logger.info(f"  ✓ STGP_{idx}: {formula}")
+        else:
+            logger.warning("Could not extract STGP formulas - _programs attribute not found")
+    except Exception as e:
+        logger.warning(f"Error extracting STGP formulas: {e}")
+    
+    return formulas
+
+
+def extract_ef_formulas(ef_model, selected_indices: list = None) -> dict:
+    """
+    Extract and display formulas from Evolutionary Forest.
+    
+    Parameters:
+    -----------
+    ef_model : EvolutionaryForestRegressor
+        Fitted EvolutionaryForestRegressor model
+    selected_indices : list
+        Indices of selected features (optional - if None, shows first 10)
+    
+    Returns:
+    --------
+    dict : Dictionary mapping feature index to formula
+    """
+    formulas = {}
+    try:
+        if hasattr(ef_model, '_best_hof') or hasattr(ef_model, 'hof'):
+            hof = getattr(ef_model, '_best_hof', getattr(ef_model, 'hof', None))
+            if hof is not None:
+                indices_to_show = selected_indices if selected_indices is not None else range(min(10, len(hof)))
+                
+                for idx in indices_to_show:
+                    if idx < len(hof):
+                        formula = str(hof[idx])
+                        formulas[f'EF_{idx}'] = formula
+                        logger.info(f"  ✓ EF_{idx}: {formula}")
+        else:
+            logger.warning("Could not extract EF formulas - hof attribute not found")
+    except Exception as e:
+        logger.warning(f"Error extracting EF formulas: {e}")
+    
+    return formulas
+
+
+def remove_duplicate_features(X_train: np.ndarray, X_test: np.ndarray, 
+                              feature_labels: list = None,
+                              correlation_threshold: float = 0.95) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    """
+    Remove highly correlated and duplicate features from feature matrix.
+    
+    Parameters:
+    -----------
+    X_train : np.ndarray
+        Training feature matrix
+    X_test : np.ndarray
+        Test feature matrix
+    feature_labels : list
+        Labels for features (for logging purposes)
+    correlation_threshold : float
+        Correlation threshold for considering features as duplicates (0-1)
+    
+    Returns:
+    --------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, list]
+        - Deduplicated X_train
+        - Deduplicated X_test
+        - Indices of retained features
+        - Labels of retained features
+    """
+    n_features = X_train.shape[1]
+    features_to_keep = []
+    
+    if feature_labels is None:
+        feature_labels = [f'Feature_{i}' for i in range(n_features)]
+    
+    # Check each feature against already selected features
+    for i in range(n_features):
+        is_duplicate = False
+        
+        for j in features_to_keep:
+            try:
+                corr_coef, _ = spearmanr(X_train[:, i], X_train[:, j])
+                
+                if np.isnan(corr_coef):
+                    corr_coef = 0
+                
+                if abs(corr_coef) >= correlation_threshold:
+                    is_duplicate = True
+                    logger.debug(f"  Duplicate: {feature_labels[i]} ↔ {feature_labels[j]} (r={corr_coef:.4f})")
+                    break
+            except Exception as e:
+                logger.debug(f"Error comparing {feature_labels[i]} and {feature_labels[j]}: {e}")
+                continue
+        
+        if not is_duplicate:
+            features_to_keep.append(i)
+    
+    kept_labels = [feature_labels[i] for i in features_to_keep]
+    logger.info(f"✓ Result: {n_features} → {len(features_to_keep)} unique features "
+               f"(Removed {n_features - len(features_to_keep)})")
+    # Filter features
+    X_train_filtered = X_train[:, features_to_keep]
+    X_test_filtered = X_test[:, features_to_keep]
+    
+    return X_train_filtered, X_test_filtered, np.array(features_to_keep), kept_labels
 
 def evaluate_regressor_performance(X_train: np.ndarray, y_train: np.ndarray, 
                                    X_test: np.ndarray, y_test: np.ndarray, 
@@ -215,27 +345,77 @@ def symbolic_regression_evolutionary_forest_feature_engineering(X: pd.DataFrame,
         y_train = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
         y_test = scaler_y.transform(y_test.reshape(-1, 1)).ravel()
 
+        # ─────────────────────────────────────────────────────────────────────
         # Stage 1: Symbolic Regression via Genetic Programming
-        logger.info("Stage 1: Applying Symbolic Transformer (STGP)...")
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info("\n" + "="*80)
+        logger.info("Stage 1/6: Fitting Symbolic Transformer (STGP)...")
+        logger.info("="*80)
+        
+        stgp_formulas_all = {}
+        X_train_stgp = None
+        X_test_stgp = None
+        stgp_model = None
+        
         try:
-            stgp = SymbolicTransformer(n_jobs=1, random_state=42, generations=20, population_size=300)
+            stgp_model = SymbolicTransformer(n_jobs=1, random_state=42, generations=20, population_size=300)
             with np.errstate(divide='ignore', invalid='ignore'):
-                stgp.fit(X_train, y_train)
-                X_train_stgp = np.nan_to_num(stgp.transform(X_train))
-                X_test_stgp = np.nan_to_num(stgp.transform(X_test))
-                logger.info(f"STGP generated {X_train_stgp.shape[1]} symbolic features")
+                stgp_model.fit(X_train, y_train)
+                X_train_stgp = np.nan_to_num(stgp_model.transform(X_train))
+                X_test_stgp = np.nan_to_num(stgp_model.transform(X_test))
+                
+                logger.info(f"✓ Generated {X_train_stgp.shape[1]} STGP features")
+                logger.info("\nAll STGP formulas:")
+                stgp_formulas_all = extract_symbolic_transformer_formulas(stgp_model)
         except Exception as e:
-            logger.error(f"STGP failed: {e}. Using original features for symbolic stage.")
+            logger.error(f"✗ STGP failed: {e}")
             X_train_stgp = X_train.copy()
             X_test_stgp = X_test.copy()
         finally:
-            del stgp
+            del stgp_model
             gc.collect()
 
-        # Stage 2: Evolutionary Forest
-        logger.info("Stage 2: Applying Evolutionary Forest (EF)...")
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 2: Select Top-K STGP Features by Importance
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info("\n" + "="*80)
+        logger.info("Stage 2/6: Selecting Top-K STGP features by importance...")
+        logger.info("="*80)
+        
+        top_stgp_indices = []
         try:
-            ef = EvolutionaryForestRegressor(
+            rf_scorer = RandomForestRegressor(n_estimators=50, n_jobs=-1, random_state=42)
+            rf_scorer.fit(X_train_stgp, y_train)
+            importances = rf_scorer.feature_importances_
+            
+            n_stgp_selected = min(n_best_features, X_train_stgp.shape[1])
+            top_stgp_indices = np.argsort(importances)[-n_stgp_selected:][::-1]
+            
+            X_train_stgp = X_train_stgp[:, top_stgp_indices]
+            X_test_stgp = X_test_stgp[:, top_stgp_indices]
+            
+            logger.info(f"✓ Selected {n_stgp_selected} STGP features")
+            logger.info("\nSelected STGP formulas:")
+            for i, idx in enumerate(top_stgp_indices):
+                formula = stgp_formulas_all.get(f'STGP_{idx}', 'N/A')
+                logger.info(f"  {i+1}. STGP_{idx}: {formula} (importance: {importances[idx]:.4f})")
+        except Exception as e:
+            logger.error(f"✗ STGP selection failed: {e}")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 3: Evolutionary Forest
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info("\n" + "="*80)
+        logger.info("Stage 3/6: Fitting Evolutionary Forest (EF)...")
+        logger.info("="*80)
+        
+        ef_formulas_all = {}
+        X_train_ef = None
+        X_test_ef = None
+        ef_model = None
+        
+        try:
+            ef_model = EvolutionaryForestRegressor(
                 random_state=42,
                 basic_primitives="Default",
                 n_gen=10,
@@ -243,39 +423,84 @@ def symbolic_regression_evolutionary_forest_feature_engineering(X: pd.DataFrame,
                 verbose=False
             )
             with np.errstate(divide='ignore', invalid='ignore'):
-                ef.fit(X_train, y_train)
-                X_train_ef = ef.transform(X_train)
-                X_test_ef = ef.transform(X_test)
-
-                # Select best features to avoid curse of dimensionality
-                n_features_ef = X_train_ef.shape[1]
-                n_select = min(n_best_features, n_features_ef)
+                ef_model.fit(X_train, y_train)
+                X_train_ef = ef_model.transform(X_train)
+                X_test_ef = ef_model.transform(X_test)
                 
-                if n_select < n_features_ef:
-                    logger.info(f"Selecting top {n_select} features from {n_features_ef} EF features")
-                    X_train_ef = X_train_ef[:, :n_select]
-                    X_test_ef = X_test_ef[:, :n_select]
-
-                X_train_ef = np.nan_to_num(X_train_ef)
-                X_test_ef = np.nan_to_num(X_test_ef)
-                logger.info(f"EF generated {X_train_ef.shape[1]} evolutionary features")
+                logger.info(f"✓ Generated {X_train_ef.shape[1]} EF features")
+                logger.info("\nTop EF formulas:")
+                ef_formulas_all = extract_ef_formulas(ef_model)
         except Exception as e:
-            logger.error(f"EF failed: {e}. Using original features for evolutionary stage.")
+            logger.error(f"✗ EF failed: {e}")
             X_train_ef = X_train.copy()
             X_test_ef = X_test.copy()
 
-        # Stage 3: Hybrid Feature Matrix Construction
-        logger.info("Stage 3: Constructing hybrid feature matrix...")
-        X_train_hybrid = np.hstack((X_train, X_train_stgp, X_train_ef))
-        X_test_hybrid = np.hstack((X_test, X_test_stgp, X_test_ef))
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 4: Select Top-K EF Features
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info("\n" + "="*80)
+        logger.info("Stage 4/6: Selecting Top-K EF features...")
+        logger.info("="*80)
         
-        logger.info(f"Original features: {X_train.shape[1]}, "
-                   f"Symbolic features: {X_train_stgp.shape[1]}, "
-                   f"Evolutionary features: {X_train_ef.shape[1]}, "
-                   f"Total hybrid features: {X_train_hybrid.shape[1]}")
+        try:
+            n_ef_total = X_train_ef.shape[1]
+            n_ef_selected = min(n_best_features, n_ef_total)
+            
+            X_train_ef = X_train_ef[:, :n_ef_selected]
+            X_test_ef = X_test_ef[:, :n_ef_selected]
+            
+            logger.info(f"✓ Selected {n_ef_selected} EF features")
+            logger.info("\nSelected EF formulas:")
+            for i in range(n_ef_selected):
+                formula = ef_formulas_all.get(f'EF_{i}', 'N/A')
+                logger.info(f"  {i+1}. EF_{i}: {formula}")
+        except Exception as e:
+            logger.error(f"✗ EF selection failed: {e}")
 
-        # Stage 4: Algorithm Performance Evaluation
-        logger.info("Stage 4: Evaluating algorithm performance...")
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 5: Combined Deduplication (STGP + EF)
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info("\n" + "="*80)
+        logger.info("Stage 5/6: Combined Deduplication (STGP + EF)...")
+        logger.info("="*80)
+        
+        try:
+            X_train_combined = np.hstack((X_train_stgp, X_train_ef))
+            X_test_combined = np.hstack((X_test_stgp, X_test_ef))
+            
+            stgp_labels = [f'STGP_{i}' for i in range(X_train_stgp.shape[1])]
+            ef_labels = [f'EF_{i}' for i in range(X_train_ef.shape[1])]
+            combined_labels = stgp_labels + ef_labels
+            
+            logger.info(f"Before dedup: {X_train_combined.shape[1]} features "
+                       f"(STGP: {len(stgp_labels)}, EF: {len(ef_labels)})")
+            X_train_constructed, X_test_constructed, _, kept_labels = remove_duplicate_features(
+                X_train_combined, X_test_combined, 
+                feature_labels=combined_labels,
+                correlation_threshold=0.95
+            )
+            
+            logger.info(f"Kept features: {', '.join(kept_labels)}")
+            
+        except Exception as e:
+            logger.error(f"✗ Deduplication failed: {e}")
+            X_train_constructed = X_train_combined.copy()
+            X_test_constructed = X_test_combined.copy()
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 6: Final Hybrid Matrix and Evaluation
+        # ─────────────────────────────────────────────────────────────────────
+        logger.info("\n" + "="*80)
+        logger.info("Stage 6/6: Algorithm Performance Evaluation...")
+        logger.info("="*80)
+        
+        X_train_hybrid = np.hstack((X_train, X_train_constructed))
+        X_test_hybrid = np.hstack((X_test, X_test_constructed))
+        
+        logger.info(f"\nFinal feature matrix:")
+        logger.info(f"  Original: {X_train.shape[1]}")
+        logger.info(f"  Constructed: {X_train_constructed.shape[1]}")
+        logger.info(f"  Total: {X_train_hybrid.shape[1]}")
         dataset_results = evaluate_regressor_performance(
             X_train, y_train, X_test, y_test, 
             X_train_hybrid, X_test_hybrid, 
