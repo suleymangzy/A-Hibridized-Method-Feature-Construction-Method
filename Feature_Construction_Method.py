@@ -68,24 +68,12 @@ except (ImportError, AttributeError) as e:
 def extract_symbolic_transformer_formulas(stgp_model, n_features: int = 10) -> dict:
     """
     Extract and display formulas from Symbolic Transformer (STGP).
-
-    Parameters
-    ----------
-    stgp_model : SymbolicTransformer
-        Fitted SymbolicTransformer model.
-    n_features : int
-        Number of features to extract (default: 10). If model has fewer, 
-        returns all available features.
-
-    Returns
-    -------
-    dict
-        Mapping of feature index label to mathematical formula string.
     """
     formulas = {}
     try:
-        if hasattr(stgp_model, '_programs'):
-            programs = stgp_model._programs
+        # HATA DÜZELTMESİ: _programs yerine sadece seçilen özellikleri içeren _best_programs kullanılmalı
+        if hasattr(stgp_model, '_best_programs'):
+            programs = stgp_model._best_programs
             n_to_show = min(n_features, len(programs))
             logger.info(f"\n{'─' * 78}")
             logger.info(f"SYMBOLIC REGRESSION (STGP) - Generated Features ({n_to_show} of {len(programs)})")
@@ -95,7 +83,7 @@ def extract_symbolic_transformer_formulas(stgp_model, n_features: int = 10) -> d
                 formulas[f'STGP_{idx}'] = formula
                 logger.info(f"  STGP_{idx:02d}: {formula}")
         else:
-            logger.warning("Could not extract STGP formulas — _programs attribute not found.")
+            logger.warning("Could not extract STGP formulas — _best_programs attribute not found.")
     except Exception as e:
         logger.warning(f"Error extracting STGP formulas: {e}")
     return formulas
@@ -104,19 +92,6 @@ def extract_symbolic_transformer_formulas(stgp_model, n_features: int = 10) -> d
 def extract_ef_formulas(ef_model, n_features: int = 10) -> dict:
     """
     Extract and display formulas from Evolutionary Forest.
-
-    Parameters
-    ----------
-    ef_model : EvolutionaryForestRegressor
-        Fitted EvolutionaryForestRegressor model.
-    n_features : int
-        Number of features to extract (default: 10). If model has fewer,
-        returns all available features.
-
-    Returns
-    -------
-    dict
-        Mapping of feature index label to mathematical formula string.
     """
     formulas = {}
     try:
@@ -128,7 +103,13 @@ def extract_ef_formulas(ef_model, n_features: int = 10) -> dict:
                 logger.info(f"EVOLUTIONARY FOREST (EF) - Generated Features ({n_to_show} of {len(hof)})")
                 logger.info(f"{'─' * 78}")
                 for idx in range(n_to_show):
-                    formula = str(hof[idx])
+                    ind = hof[idx]
+                    # FORMAT DÜZELTMESİ: Liste halinde gelen EF ağaçlarını okunaklı bir string'e çeviriyoruz
+                    if isinstance(ind, (list, tuple)):
+                        formula = " | ".join(str(tree) for tree in ind)
+                    else:
+                        formula = str(ind)
+                        
                     formulas[f'EF_{idx}'] = formula
                     logger.info(f"  EF_{idx:02d}: {formula}")
         else:
@@ -367,8 +348,9 @@ def sr_ef_feature_engineering(
         logger.info("=" * 80)
 
         stgp_formulas_all = {}
-        X_train_stgp = X_train.copy()
-        X_test_stgp  = X_test.copy()
+        # HATA DÜZELTMESİ: STGP başarısız olursa orijinal özelliklerin kopya olmasını engellemek için boş array atandı.
+        X_train_stgp = np.empty((X_train.shape[0], 0))
+        X_test_stgp  = np.empty((X_test.shape[0], 0))
 
         try:
             stgp_model = SymbolicTransformer(
@@ -379,7 +361,7 @@ def sr_ef_feature_engineering(
                 X_train_stgp = np.nan_to_num(stgp_model.transform(X_train))
                 X_test_stgp  = np.nan_to_num(stgp_model.transform(X_test))
                 logger.info(f"✓ Generated {X_train_stgp.shape[1]} STGP features")
-                stgp_formulas_all = extract_symbolic_transformer_formulas(stgp_model, n_features=10)
+                stgp_formulas_all = extract_symbolic_transformer_formulas(stgp_model, n_features=n_best_features)
         except Exception as e:
             logger.error(f"✗ STGP failed: {e}")
         finally:
@@ -391,19 +373,21 @@ def sr_ef_feature_engineering(
             gc.collect()
 
         # ─────────────────────────────────────────────────────────────────────
-        # Stage 2 — Top 10 STGP Features
+        # Stage 2 — Top STGP Features
         # ─────────────────────────────────────────────────────────────────────
         logger.info("\n" + "=" * 80)
-        logger.info("Stage 2/4: Top 10 STGP Features")
+        logger.info(f"Stage 2/4: Top {n_best_features} STGP Features")
         logger.info("=" * 80)
 
-        top_stgp_indices = []
         try:
-            n_stgp_selected = min(10, X_train_stgp.shape[1])
-            top_stgp_indices = np.arange(n_stgp_selected)
-            X_train_stgp = X_train_stgp[:, top_stgp_indices]
-            X_test_stgp  = X_test_stgp[:, top_stgp_indices]
-            logger.info(f"✓ Selected {n_stgp_selected} STGP features")
+            n_stgp_selected = min(n_best_features, X_train_stgp.shape[1])
+            if n_stgp_selected > 0:
+                top_stgp_indices = np.arange(n_stgp_selected)
+                X_train_stgp = X_train_stgp[:, top_stgp_indices]
+                X_test_stgp  = X_test_stgp[:, top_stgp_indices]
+                logger.info(f"✓ Selected {n_stgp_selected} STGP features")
+            else:
+                logger.warning("No STGP features were generated/selected.")
         except Exception as e:
             logger.error(f"✗ STGP feature extraction failed: {e}")
 
@@ -415,8 +399,9 @@ def sr_ef_feature_engineering(
         logger.info("=" * 80)
 
         ef_formulas_all = {}
-        X_train_ef = X_train.copy()
-        X_test_ef  = X_test.copy()
+        # HATA DÜZELTMESİ: EF başarısız olursa orijinal özelliklerin kopya olmasını engellemek için boş array atandı.
+        X_train_ef = np.empty((X_train.shape[0], 0))
+        X_test_ef  = np.empty((X_test.shape[0], 0))
 
         try:
             ef_model = EvolutionaryForestRegressor(
@@ -431,11 +416,11 @@ def sr_ef_feature_engineering(
                 X_train_ef = ef_model.transform(X_train)
                 X_test_ef  = ef_model.transform(X_test)
                 logger.info(f"✓ Generated {X_train_ef.shape[1]} EF features")
-                ef_formulas_all = extract_ef_formulas(ef_model, n_features=10)
+                ef_formulas_all = extract_ef_formulas(ef_model, n_features=n_best_features)
         except Exception as e:
             logger.error(f"✗ EF failed: {e}")
         finally:
-            # Release EF model memory — mirrors the STGP cleanup pattern
+            # Release EF model memory
             try:
                 del ef_model
             except NameError:
@@ -443,17 +428,20 @@ def sr_ef_feature_engineering(
             gc.collect()
 
         # ─────────────────────────────────────────────────────────────────────
-        # Stage 4 — Top 10 EF Features
+        # Stage 4 — Top EF Features
         # ─────────────────────────────────────────────────────────────────────
         logger.info("\n" + "=" * 80)
-        logger.info("Stage 4/4: Top 10 EF Features")
+        logger.info(f"Stage 4/4: Top {n_best_features} EF Features")
         logger.info("=" * 80)
 
         try:
-            n_ef_selected = min(10, X_train_ef.shape[1])
-            X_train_ef = X_train_ef[:, :n_ef_selected]
-            X_test_ef  = X_test_ef[:, :n_ef_selected]
-            logger.info(f"✓ Selected {n_ef_selected} EF features")
+            n_ef_selected = min(n_best_features, X_train_ef.shape[1])
+            if n_ef_selected > 0:
+                X_train_ef = X_train_ef[:, :n_ef_selected]
+                X_test_ef  = X_test_ef[:, :n_ef_selected]
+                logger.info(f"✓ Selected {n_ef_selected} EF features")
+            else:
+                logger.warning("No EF features were generated/selected.")
         except Exception as e:
             logger.error(f"✗ EF selection failed: {e}")
 
@@ -468,25 +456,26 @@ def sr_ef_feature_engineering(
             X_train_combined = np.hstack((X_train_stgp, X_train_ef))
             X_test_combined  = np.hstack((X_test_stgp, X_test_ef))
 
-            stgp_labels    = [f'STGP_{i}' for i in range(X_train_stgp.shape[1])]
-            ef_labels      = [f'EF_{i}'   for i in range(X_train_ef.shape[1])]
+            stgp_labels = [f'STGP_{i}' for i in range(X_train_stgp.shape[1])]
+            ef_labels   = [f'EF_{i}'   for i in range(X_train_ef.shape[1])]
             combined_labels = stgp_labels + ef_labels
 
-            logger.info(f"\n✓ Combined Features:")
+            logger.info("\n✓ Combined Features:")
             logger.info(f"  STGP Features: {len(stgp_labels)}")
             logger.info(f"  EF Features:   {len(ef_labels)}")
             logger.info(f"  Total:         {X_train_combined.shape[1]}")
-            logger.info(f"\nFeature List: {', '.join(combined_labels)}")
+            if combined_labels:
+                logger.info(f"\nFeature List: {', '.join(combined_labels)}")
 
-            # No deduplication applied — using all constructed features
             X_train_constructed = X_train_combined.copy()
             X_test_constructed  = X_test_combined.copy()
 
         except Exception as e:
             logger.error(f"✗ Feature combination failed: {e}")
-            X_train_constructed = X_train_combined.copy()
-            X_test_constructed  = X_test_combined.copy()
+            X_train_constructed = np.empty((X_train.shape[0], 0))
+            X_test_constructed  = np.empty((X_test.shape[0], 0))
 
+        # Orijinal matris ve yeni üretilenler (yatay olarak) birleştirilir
         X_train_hybrid = np.hstack((X_train, X_train_constructed))
         X_test_hybrid  = np.hstack((X_test, X_test_constructed))
 
@@ -495,6 +484,7 @@ def sr_ef_feature_engineering(
         logger.info(f"  Constructed: {X_train_constructed.shape[1]}")
         logger.info(f"  Total:       {X_train_hybrid.shape[1]}")
 
+        # Daha önce tanımlanan performans fonksiyonu çağrılıyor
         dataset_results = evaluate_regressor_performance(
             X_train, y_train, X_test, y_test,
             X_train_hybrid, X_test_hybrid,
