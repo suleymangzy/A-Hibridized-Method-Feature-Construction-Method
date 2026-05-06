@@ -11,6 +11,7 @@ This module implements a hybridized feature construction method that combines:
 for regression tasks.
 """
 
+import re
 import gc
 import logging
 import traceback
@@ -65,13 +66,67 @@ except (ImportError, AttributeError) as e:
     logger.warning(f"Evolutionary Forest compatibility patch failed: {e}")
 
 
+def format_math_expr(expr: str) -> str:
+    """
+    Prefix (önek) formatındaki STGP ve EF formüllerini standart 
+    matematiksel notasyona (infix) çevirir. 
+    Örn: Add(ARG0, Mul(-1, ARG1)) -> (x0 + (-1 * x1))
+    """
+    # EF'deki ARG0, ARG1 gibi değişkenleri x0, x1 yap
+    expr = re.sub(r'(?i)ARG(\d+)', r'x\1', expr)
+    
+    # STGP'deki X0, X1 gibi değişkenleri de x0, x1 yap
+    expr = re.sub(r'\bX(\d+)\b', r'x\1', expr)
+    
+    # x0, x1 gibi değişkenleri eval() sırasında hata vermemesi için string içine al ("x0" gibi)
+    expr = re.sub(r'\b(x\d+)\b', r'"\1"', expr)
+    
+    # Matematiksel operatörlerin standart karşılıklarını tanımla (Büyük/Küçük harf duyarlı)
+    safe_dict = {
+        'Add': lambda a, b: f"({a} + {b})",
+        'add': lambda a, b: f"({a} + {b})",
+        'Sub': lambda a, b: f"({a} - {b})",
+        'sub': lambda a, b: f"({a} - {b})",
+        'Mul': lambda a, b: f"({a} * {b})",
+        'mul': lambda a, b: f"({a} * {b})",
+        'Div': lambda a, b: f"({a} / {b})",
+        'div': lambda a, b: f"({a} / {b})",
+        'AQ':  lambda a, b: f"({a} / {b})",  # Analytic Quotient (korumalı bölme)
+        'Sin': lambda a: f"sin({a})",
+        'sin': lambda a: f"sin({a})",
+        'Cos': lambda a: f"cos({a})",
+        'cos': lambda a: f"cos({a})",
+        'Exp': lambda a: f"exp({a})",
+        'exp': lambda a: f"exp({a})",
+        'Log': lambda a: f"log({a})",
+        'log': lambda a: f"log({a})",
+        'Abs': lambda a: f"abs({a})",
+        'abs': lambda a: f"abs({a})",
+        'Neg': lambda a: f"(-{a})",
+        'neg': lambda a: f"(-{a})",
+        'Inv': lambda a: f"(1 / {a})",
+        'inv': lambda a: f"(1 / {a})",
+        'Max': lambda a, b: f"max({a}, {b})",
+        'max': lambda a, b: f"max({a}, {b})",
+        'Min': lambda a, b: f"min({a}, {b})",
+        'min': lambda a, b: f"min({a}, {b})"
+    }
+    
+    try:
+        # String'i eval() ile değerlendirip matematiksel ifadelere çeviriyoruz
+        formatted_expr = eval(expr, {"__builtins__": {}}, safe_dict)
+        return formatted_expr
+    except Exception:
+        # Eğer tanımlanmayan bir fonksiyon varsa orijinal haline geri dön (tırnakları temizleyerek)
+        return expr.replace('"', '')
+
+
 def extract_symbolic_transformer_formulas(stgp_model, n_features: int = 10) -> dict:
     """
     Extract and display formulas from Symbolic Transformer (STGP).
     """
     formulas = {}
     try:
-        # HATA DÜZELTMESİ: _programs yerine sadece seçilen özellikleri içeren _best_programs kullanılmalı
         if hasattr(stgp_model, '_best_programs'):
             programs = stgp_model._best_programs
             n_to_show = min(n_features, len(programs))
@@ -79,7 +134,9 @@ def extract_symbolic_transformer_formulas(stgp_model, n_features: int = 10) -> d
             logger.info(f"SYMBOLIC REGRESSION (STGP) - Generated Features ({n_to_show} of {len(programs)})")
             logger.info(f"{'─' * 78}")
             for idx in range(n_to_show):
-                formula = str(programs[idx])
+                raw_formula = str(programs[idx])
+                # HATA DÜZELTMESİ: Matematiksel formata çevirici fonksiyon çağrıldı
+                formula = format_math_expr(raw_formula)
                 formulas[f'STGP_{idx}'] = formula
                 logger.info(f"  STGP_{idx:02d}: {formula}")
         else:
@@ -104,11 +161,11 @@ def extract_ef_formulas(ef_model, n_features: int = 10) -> dict:
                 logger.info(f"{'─' * 78}")
                 for idx in range(n_to_show):
                     ind = hof[idx]
-                    # FORMAT DÜZELTMESİ: Liste halinde gelen EF ağaçlarını okunaklı bir string'e çeviriyoruz
+                    # HATA DÜZELTMESİ: Matematiksel formata çevirici fonksiyon çağrıldı
                     if isinstance(ind, (list, tuple)):
-                        formula = " | ".join(str(tree) for tree in ind)
+                        formula = " | ".join(format_math_expr(str(tree)) for tree in ind)
                     else:
-                        formula = str(ind)
+                        formula = format_math_expr(str(ind))
                         
                     formulas[f'EF_{idx}'] = formula
                     logger.info(f"  EF_{idx:02d}: {formula}")
