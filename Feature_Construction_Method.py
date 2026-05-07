@@ -66,19 +66,25 @@ except (ImportError, AttributeError) as e:
     logger.warning(f"Evolutionary Forest compatibility patch failed: {e}")
 
 
+logger = logging.getLogger(__name__)
+
 def format_math_expr(expr: str) -> str:
     """
     Prefix (önek) formatındaki STGP ve EF formüllerini standart 
     matematiksel notasyona (infix) çevirir. 
-    Örn: Add(ARG0, Mul(-1, ARG1)) -> (x0 + (-1 * x1))
+    Ayrıca liste formatında gelen EF ağaç yığınlarını " | " ile ayırarak birleştirir.
     """
-    # EF'deki ARG0, ARG1 gibi değişkenleri x0, x1 yap
-    expr = re.sub(r'(?i)ARG(\d+)', r'x\1', expr)
+    expr = str(expr).strip()
     
-    # STGP'deki X0, X1 gibi değişkenleri de x0, x1 yap
+    # Değişken isimlerini standartlaştır (ARG0 -> x0, X0 -> x0)
+    expr = re.sub(r'(?i)ARG(\d+)', r'x\1', expr)
     expr = re.sub(r'\bX(\d+)\b', r'x\1', expr)
     
-    # x0, x1 gibi değişkenleri eval() sırasında hata vermemesi için string içine al ("x0" gibi)
+    # DÜZELTME: Liste içindeki string tırnaklarını temizle ki fonksiyon gibi çalışsınlar
+    # Örn: "['Sub(x0, x0)']" -> "[Sub(x0, x0)]" 
+    expr = expr.replace('"', '').replace("'", "")
+    
+    # Değişkenleri eval() için tırnak içine al (x0 -> "x0")
     expr = re.sub(r'\b(x\d+)\b', r'"\1"', expr)
     
     # Matematiksel operatörlerin standart karşılıklarını tanımla (Büyük/Küçük harf duyarlı)
@@ -115,9 +121,14 @@ def format_math_expr(expr: str) -> str:
     try:
         # String'i eval() ile değerlendirip matematiksel ifadelere çeviriyoruz
         formatted_expr = eval(expr, {"__builtins__": {}}, safe_dict)
-        return formatted_expr
+        
+        # Eğer sonuç bir listeye dönüştüyse (EF formatı), elemanları | ile birleştir
+        if isinstance(formatted_expr, (list, tuple)):
+            return " | ".join(str(x) for x in formatted_expr)
+            
+        return str(formatted_expr)
     except Exception:
-        # Eğer tanımlanmayan bir fonksiyon varsa orijinal haline geri dön (tırnakları temizleyerek)
+        # Parse edilemeyen bir durum olursa temizlenmiş haliyle geri döndür
         return expr.replace('"', '')
 
 
@@ -135,7 +146,6 @@ def extract_symbolic_transformer_formulas(stgp_model, n_features: int = 10) -> d
             logger.info(f"{'─' * 78}")
             for idx in range(n_to_show):
                 raw_formula = str(programs[idx])
-                # HATA DÜZELTMESİ: Matematiksel formata çevirici fonksiyon çağrıldı
                 formula = format_math_expr(raw_formula)
                 formulas[f'STGP_{idx}'] = formula
                 logger.info(f"  STGP_{idx:02d}: {formula}")
@@ -161,11 +171,10 @@ def extract_ef_formulas(ef_model, n_features: int = 10) -> dict:
                 logger.info(f"{'─' * 78}")
                 for idx in range(n_to_show):
                     ind = hof[idx]
-                    # HATA DÜZELTMESİ: Matematiksel formata çevirici fonksiyon çağrıldı
-                    if isinstance(ind, (list, tuple)):
-                        formula = " | ".join(format_math_expr(str(tree)) for tree in ind)
-                    else:
-                        formula = format_math_expr(str(ind))
+                    
+                    # DÜZELTME: Doğrudan `ind` objesini string'e çevirip parser'a veriyoruz.
+                    # format_math_expr içerisindeki liste kontrolü bunu otomatik çözecektir.
+                    formula = format_math_expr(str(ind))
                         
                     formulas[f'EF_{idx}'] = formula
                     logger.info(f"  EF_{idx:02d}: {formula}")
